@@ -128,22 +128,87 @@ const messages = [
   new HumanMessage('帮我创建一个vue项目并跑起来'),
 ]
 
-let result = await modelWithTools.invoke(messages)
-console.log(result)
+// 仅裁剪控制台预览，传给模型的工具结果始终保留完整内容。
+function preview(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
+  const visible = lines.slice(0, 20).join('\n');
+  const clipped = visible.slice(0, 2000);
+  return clipped + (lines.length > 20 || visible.length > 2000
+    ? '\n…（控制台预览已截断）' : '');
+}
+
+function logBlock(title, content) {
+  console.log(`\n── ${title} ──\n${content}`);
+}
+
+function formatToolResult(name, value) {
+  if (name === 'execCommand') {
+    const { exitCode, stdout, stderr } = typeof value === 'string'
+      ? JSON.parse(value) : value;
+    return [
+      `退出码：${exitCode ?? '未正常退出'}`,
+      stdout?.trim() ? `标准输出：\n${preview(stdout.trimEnd())}` : '标准输出：（空）',
+      stderr?.trim() ? `标准错误：\n${preview(stderr.trimEnd())}` : '',
+    ].filter(Boolean).join('\n');
+  }
+  if (name === 'listDir' && Array.isArray(value)) {
+    return `共 ${value.length} 项\n${preview(value.join('\n'))}`;
+  }
+  return preview(value);
+}
+
+function messageText(content) {
+  return typeof content === 'string' ? content : content
+    .filter(block => block.type === 'text')
+    .map(block => block.text).join('\n');
+}
+
+let round = 0;
+async function requestModel() {
+  const currentRound = ++round;
+  const started = Date.now();
+  console.log(`\n[第 ${currentRound} 轮] 正在等待模型响应…`);
+  const timer = setInterval(() => {
+    console.log(`[第 ${currentRound} 轮] 仍在等待（${Math.round((Date.now() - started) / 1000)} 秒）…`);
+  }, 10000);
+  try {
+    const response = await modelWithTools.invoke(messages);
+    console.log(`[第 ${currentRound} 轮] 模型已返回，用时 ${((Date.now() - started) / 1000).toFixed(1)} 秒，工具调用 ${response.tool_calls?.length ?? 0} 个`);
+    return response;
+  } catch (error) {
+    console.error(`[第 ${currentRound} 轮] 模型请求失败：${error.message}`);
+    throw error;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+let result = await requestModel();
 
 while (result.tool_calls && result.tool_calls.length > 0) {
   messages.push(result)
-  const toolCallResults = await Promise.all(result.tool_calls.map(async toolCall => {
+  const explanation = messageText(result.content);
+  if (explanation) logBlock('模型说明', explanation);
+  const toolCallResults = await Promise.all(result.tool_calls.map(async (toolCall, index) => {
     const toolArgs = toolCall.args;
     const toolName = toolCall.name;
     const tool = tools.find(tool => tool.name === toolName);
     if (!tool) {
       throw new Error(`Tool ${toolName} not found`);
     }
-    console.log(`Tool call: ${toolName} with input: ${JSON.stringify(toolArgs)}`);
-    const result = await tool.invoke(toolArgs);
-    console.log(`Tool result: ${JSON.stringify(result)}`);
-    return result;
+    const label = `${round}.${index + 1} ${toolName}`;
+    logBlock(`工具 ${label} · 开始`, preview(toolArgs));
+    const started = Date.now();
+    try {
+      const result = await tool.invoke(toolArgs);
+      logBlock(`工具 ${label} · 返回 · ${((Date.now() - started) / 1000).toFixed(1)} 秒`,
+        formatToolResult(toolName, result));
+      return result;
+    } catch (error) {
+      logBlock(`工具 ${label} · 失败`, error.message);
+      throw error;
+    }
   }));
 
   // 将工具结果添加到消息历史
@@ -157,7 +222,7 @@ while (result.tool_calls && result.tool_calls.length > 0) {
   });
 
   // 再次调用模型，传入工具结果
-  result = await modelWithTools.invoke(messages);
+  result = await requestModel();
 }
 
-console.log(result.content)
+logBlock('最终回答', messageText(result.content));
